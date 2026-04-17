@@ -80,3 +80,9 @@ def test_extract_text_multipage(tmp_path):
 def test_extract_text_link_annotation(pdf_with_link):
     result = extract_text(pdf_with_link)
     assert "https://example.com" in result
+
+
+def test_extract_text_accepts_bytes(digital_pdf):
+    pdf_bytes = digital_pdf.read_bytes()
+    result = extract_text(pdf_bytes)
+    assert "Hello World" in result
