@@ -80,3 +80,16 @@ def test_extract_text_multipage(tmp_path):
 def test_extract_text_link_annotation(pdf_with_link):
     result = extract_text(pdf_with_link)
     assert "https://example.com" in result
+
+
+def test_extract_text_accepts_bytes(digital_pdf):
+    pdf_bytes = digital_pdf.read_bytes()
+    result = extract_text(pdf_bytes)
+    assert isinstance(result, str)
+    assert "Hello World" in result
+    assert "Second line" in result
+
+
+def test_extract_text_bytes_invalid_raises():
+    with pytest.raises(Exception):
+        extract_text(b"not a pdf")

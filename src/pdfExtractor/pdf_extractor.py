@@ -1,15 +1,19 @@
 from pathlib import Path
+from typing import Union
 import fitz
 # import pytesseract
 # from PIL import Image
 # import io
 
 
-def extract_text(pdf_path: Path) -> str:
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-    doc = fitz.open(str(pdf_path))
+def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
+    if isinstance(pdf_input, bytes):
+        doc = fitz.open(stream=pdf_input, filetype="pdf")
+    else:
+        pdf_path = Path(pdf_input)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+        doc = fitz.open(str(pdf_path))
     full_text = []
 
     for page in doc:
