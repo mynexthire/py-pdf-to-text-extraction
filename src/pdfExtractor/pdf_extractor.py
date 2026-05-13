@@ -11,12 +11,18 @@ def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
 
 def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
     if isinstance(pdf_input, bytes):
-        doc = fitz.open(stream=pdf_input, filetype="pdf")
+        try:
+            doc = fitz.open(stream=pdf_input, filetype="pdf")
+        except Exception:
+            return "", True
     else:
         pdf_path = Path(pdf_input)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
-        doc = fitz.open(str(pdf_path))
+        try:
+            doc = fitz.open(str(pdf_path))
+        except Exception:
+            return "", True
 
     page_count = doc.page_count
     if page_count == 0:
@@ -75,7 +81,18 @@ def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
                 cv_pages_flagged += 1
 
     doc.close()
-    return "\n".join(full_text).strip(), cv_pages_flagged > 0
+
+    extracted = "\n".join(full_text).strip()
+
+    # All checked pages must be flagged — a single image page (portfolio cover,
+    # certificate attachment) among digital pages should not mark the whole CV
+    if cv_pages_flagged >= min(cv_page_limit, page_count):
+        # Even if flagged as image-based, enough extracted text means GenAI can still use it
+        if len(extracted.split()) >= 100:
+            return extracted, False
+        return extracted, True
+
+    return extracted, False
 
 
 def _extract_digital_page(page, all_words: list | None = None) -> str:

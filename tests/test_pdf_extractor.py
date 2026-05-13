@@ -4,9 +4,13 @@ from pathlib import Path
 from pdfExtractor import extract_text, extract
 
 
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
 @pytest.fixture
 def digital_pdf(tmp_path) -> Path:
-    """Create a simple digital PDF with known text content."""
+    """Simple digital PDF with known text content."""
     pdf_path = tmp_path / "test.pdf"
     doc = fitz.open()
     page = doc.new_page()
@@ -19,7 +23,7 @@ def digital_pdf(tmp_path) -> Path:
 
 @pytest.fixture
 def pdf_with_link(tmp_path) -> Path:
-    """Create a PDF page containing a hyperlink."""
+    """PDF page containing a hyperlink."""
     pdf_path = tmp_path / "linked.pdf"
     doc = fitz.open()
     page = doc.new_page()
@@ -30,74 +34,6 @@ def pdf_with_link(tmp_path) -> Path:
     doc.close()
     return pdf_path
 
-
-def test_extract_text_returns_string(digital_pdf):
-    result = extract_text(digital_pdf)
-    assert isinstance(result, str)
-
-
-def test_extract_text_contains_content(digital_pdf):
-    result = extract_text(digital_pdf)
-    assert "Hello World" in result
-    assert "Second line" in result
-
-
-def test_extract_text_accepts_string_path(digital_pdf):
-    result = extract_text(str(digital_pdf))
-    assert "Hello World" in result
-
-
-def test_extract_text_file_not_found():
-    with pytest.raises(FileNotFoundError):
-        extract_text(Path("/nonexistent/file.pdf"))
-
-
-def test_extract_text_empty_pdf(tmp_path):
-    pdf_path = tmp_path / "empty.pdf"
-    doc = fitz.open()
-    doc.new_page()
-    doc.save(str(pdf_path))
-    doc.close()
-    result = extract_text(pdf_path)
-    assert result == ""
-
-
-def test_extract_text_multipage(tmp_path):
-    pdf_path = tmp_path / "multi.pdf"
-    doc = fitz.open()
-    for i in range(3):
-        page = doc.new_page()
-        page.insert_text((72, 72), f"Page {i + 1} content")
-    doc.save(str(pdf_path))
-    doc.close()
-
-    result = extract_text(pdf_path)
-    assert "Page 1 content" in result
-    assert "Page 2 content" in result
-    assert "Page 3 content" in result
-
-
-def test_extract_text_link_annotation(pdf_with_link):
-    result = extract_text(pdf_with_link)
-    assert "https://example.com" in result
-
-
-def test_extract_text_accepts_bytes(digital_pdf):
-    pdf_bytes = digital_pdf.read_bytes()
-    result = extract_text(pdf_bytes)
-    assert isinstance(result, str)
-    assert "Hello World" in result
-    assert "Second line" in result
-
-
-def test_extract_text_bytes_invalid_raises():
-    with pytest.raises(Exception):
-        extract_text(b"not a pdf")
-
-
-# ---------------------------------------------------------------------------
-# Fixtures for extract() tests
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def image_pdf(tmp_path) -> Path:
@@ -120,7 +56,6 @@ def rich_text_pdf(tmp_path) -> Path:
     pdf_path = tmp_path / "rich.pdf"
     doc = fitz.open()
     page = doc.new_page()
-    # insert_textbox wraps within rect so all words render on the page
     page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
     doc.save(str(pdf_path))
     doc.close()
@@ -128,7 +63,71 @@ def rich_text_pdf(tmp_path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# extract() — basic API contract
+# extract_text() — basic contract
+# ---------------------------------------------------------------------------
+
+def test_extract_text_returns_string(digital_pdf):
+    result = extract_text(digital_pdf)
+    assert isinstance(result, str)
+
+
+def test_extract_text_contains_content(digital_pdf):
+    result = extract_text(digital_pdf)
+    assert "Hello World" in result
+    assert "Second line" in result
+
+
+def test_extract_text_accepts_string_path(digital_pdf):
+    result = extract_text(str(digital_pdf))
+    assert "Hello World" in result
+
+
+def test_extract_text_file_not_found():
+    with pytest.raises(FileNotFoundError):
+        extract_text(Path("/nonexistent/file.pdf"))
+
+
+def test_extract_text_blank_page_returns_empty(tmp_path):
+    pdf_path = tmp_path / "blank.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(str(pdf_path))
+    doc.close()
+    assert extract_text(pdf_path) == ""
+
+
+def test_extract_text_multipage(tmp_path):
+    pdf_path = tmp_path / "multi.pdf"
+    doc = fitz.open()
+    for i in range(3):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Page {i + 1} content")
+    doc.save(str(pdf_path))
+    doc.close()
+    result = extract_text(pdf_path)
+    assert "Page 1 content" in result
+    assert "Page 2 content" in result
+    assert "Page 3 content" in result
+
+
+def test_extract_text_link_annotation(pdf_with_link):
+    result = extract_text(pdf_with_link)
+    assert "https://example.com" in result
+
+
+def test_extract_text_accepts_bytes(digital_pdf):
+    pdf_bytes = digital_pdf.read_bytes()
+    result = extract_text(pdf_bytes)
+    assert isinstance(result, str)
+    assert "Hello World" in result
+
+
+def test_extract_text_corrupt_bytes_returns_empty():
+    assert extract_text(b"not a pdf") == ""
+
+
+# ---------------------------------------------------------------------------
+# extract() — API contract
 # ---------------------------------------------------------------------------
 
 def test_extract_returns_tuple(digital_pdf):
@@ -142,8 +141,8 @@ def test_extract_text_part_is_string(digital_pdf):
 
 
 def test_extract_flag_is_bool(digital_pdf):
-    _, flag = extract(digital_pdf)
-    assert isinstance(flag, bool)
+    _, is_image = extract(digital_pdf)
+    assert isinstance(is_image, bool)
 
 
 def test_extract_text_matches_extract_text(digital_pdf):
@@ -151,17 +150,15 @@ def test_extract_text_matches_extract_text(digital_pdf):
 
 
 # ---------------------------------------------------------------------------
-# extract() — isImagePresent = False (digital PDFs)
+# extract() — is_image = False (digital)
 # ---------------------------------------------------------------------------
 
 def test_extract_digital_pdf_not_image(digital_pdf):
-    # 5 words (< 30) → +40, but has fonts and no images → total 40 < 50 → False
     _, is_image = extract(digital_pdf)
     assert is_image is False
 
 
 def test_extract_rich_text_not_image(rich_text_pdf):
-    # 35 words → word criterion not triggered → score 0 → False
     _, is_image = extract(rich_text_pdf)
     assert is_image is False
 
@@ -171,8 +168,19 @@ def test_extract_rich_text_content_preserved(rich_text_pdf):
     assert "word0" in text and "word34" in text
 
 
+def test_extract_accepts_bytes_digital(digital_pdf):
+    text, is_image = extract(digital_pdf.read_bytes())
+    assert "Hello World" in text
+    assert is_image is False
+
+
+def test_extract_accepts_string_path(digital_pdf):
+    text, _ = extract(str(digital_pdf))
+    assert "Hello World" in text
+
+
 # ---------------------------------------------------------------------------
-# extract() — isImagePresent = True (image / scanned PDFs)
+# extract() — is_image = True (scanned / unparseable)
 # ---------------------------------------------------------------------------
 
 def test_extract_image_pdf_is_image(image_pdf):
@@ -186,12 +194,8 @@ def test_extract_image_pdf_text_is_empty(image_pdf):
     assert text == ""
 
 
-# ---------------------------------------------------------------------------
-# extract() — edge cases
-# ---------------------------------------------------------------------------
-
-def test_extract_blank_page_pdf_is_image(tmp_path):
-    # No text (+40) and no font resources (+30) = score 70 → flagged as image
+def test_extract_blank_page_is_image(tmp_path):
+    # No text (+40) and no font resources (+30) = score 70 → True
     pdf_path = tmp_path / "blank_page.pdf"
     doc = fitz.open()
     doc.new_page()
@@ -201,15 +205,24 @@ def test_extract_blank_page_pdf_is_image(tmp_path):
     assert text == "" and is_image is True
 
 
-def test_extract_accepts_bytes(digital_pdf):
-    text, is_image = extract(digital_pdf.read_bytes())
-    assert "Hello World" in text
-    assert is_image is False
+def test_extract_both_pages_scanned_is_image(tmp_path):
+    """Both checked pages are image-only → True."""
+    pdf_path = tmp_path / "scanned_2page.pdf"
+    doc = fitz.open()
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
+    for _ in range(2):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(fitz.Rect(0, 0, 550, 800), pixmap=pix)
+    doc.save(str(pdf_path))
+    doc.close()
+    _, is_image = extract(pdf_path)
+    assert is_image is True
 
 
-def test_extract_accepts_string_path(digital_pdf):
-    text, _ = extract(str(digital_pdf))
-    assert "Hello World" in text
+def test_extract_corrupt_bytes_is_image():
+    _, is_image = extract(b"not a pdf")
+    assert is_image is True
 
 
 def test_extract_file_not_found():
@@ -217,23 +230,37 @@ def test_extract_file_not_found():
         extract(Path("/nonexistent/file.pdf"))
 
 
-def test_extract_invalid_bytes_raises():
-    with pytest.raises(Exception):
-        extract(b"not a pdf")
-
-
 # ---------------------------------------------------------------------------
-# extract() — multipage majority logic
+# extract() — image-based but enough text → False (send to GenAI)
 # ---------------------------------------------------------------------------
 
-def test_extract_image_page_after_first_three_ignored(tmp_path):
-    """3 digital CV pages + image page at page 4 → scanned attachment ignored → isImagePresent False."""
-    pdf_path = tmp_path / "digital_cv_scanned_attachment.pdf"
+def test_extract_image_based_with_enough_text_not_image(tmp_path):
+    """Pages flagged as image-based but >= 100 extracted words → False (send to GenAI)."""
+    pdf_path = tmp_path / "image_with_text.pdf"
     doc = fitz.open()
-    for _ in range(3):
-        page = doc.new_page()
-        page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
-    # page 4: scanned certificate — should be ignored
+    page = doc.new_page(width=595, height=842)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
+    page.insert_image(fitz.Rect(0, 0, 550, 800), pixmap=pix)
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(110)))
+    doc.save(str(pdf_path))
+    doc.close()
+    text, is_image = extract(pdf_path)
+    assert is_image is False
+    assert len(text.split()) >= 100
+
+
+# ---------------------------------------------------------------------------
+# extract() — portfolio / mixed CV (page 1 digital + page 2 image)
+# ---------------------------------------------------------------------------
+
+def test_extract_portfolio_cover_plus_text_not_image(tmp_path):
+    """Digital page 1 + image page 2 → False."""
+    pdf_path = tmp_path / "portfolio.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
     page = doc.new_page(width=595, height=842)
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
     pix.set_rect(pix.irect, (200, 200, 200))
@@ -244,8 +271,45 @@ def test_extract_image_page_after_first_three_ignored(tmp_path):
     assert is_image is False
 
 
-def test_extract_image_page_at_three_not_flagged(tmp_path):
-    """2 digital pages + image page at page 3 → certificate attachment, not CV → isImagePresent False."""
+def test_extract_image_page2_text_still_extracted(tmp_path):
+    """Text from page 1 is returned even when page 2 is image-based."""
+    pdf_path = tmp_path / "mixed.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    page = doc.new_page(width=595, height=842)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
+    page.insert_image(fitz.Rect(0, 0, 550, 800), pixmap=pix)
+    doc.save(str(pdf_path))
+    doc.close()
+    text, _ = extract(pdf_path)
+    assert "word0" in text
+
+
+# ---------------------------------------------------------------------------
+# extract() — scanned attachments beyond the checked page window
+# ---------------------------------------------------------------------------
+
+def test_extract_image_page_beyond_limit_not_image(tmp_path):
+    """3 digital pages + image page at page 4 → False."""
+    pdf_path = tmp_path / "digital_cv_scanned_attachment.pdf"
+    doc = fitz.open()
+    for _ in range(3):
+        page = doc.new_page()
+        page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    page = doc.new_page(width=595, height=842)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
+    page.insert_image(fitz.Rect(0, 0, 550, 800), pixmap=pix)
+    doc.save(str(pdf_path))
+    doc.close()
+    _, is_image = extract(pdf_path)
+    assert is_image is False
+
+
+def test_extract_image_page_at_page3_not_image(tmp_path):
+    """2 digital pages + image page at page 3 → False."""
     pdf_path = tmp_path / "cv_with_scanned_page3.pdf"
     doc = fitz.open()
     for _ in range(2):
@@ -261,16 +325,16 @@ def test_extract_image_page_at_three_not_flagged(tmp_path):
     assert is_image is False
 
 
-def test_extract_multipage_image_cv_flagged(tmp_path):
-    """1 digital page + 2 image pages → page 1 is digital → isImagePresent False."""
+def test_extract_digital_page1_with_two_image_pages_not_image(tmp_path):
+    """1 digital page + 2 image pages → False."""
     pdf_path = tmp_path / "mostly_image.pdf"
     doc = fitz.open()
     page = doc.new_page()
     page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
     for _ in range(2):
         page = doc.new_page(width=595, height=842)
-        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
-        pix.set_rect(pix.irect, (200, 200, 200))
         page.insert_image(fitz.Rect(0, 0, 550, 800), pixmap=pix)
     doc.save(str(pdf_path))
     doc.close()
