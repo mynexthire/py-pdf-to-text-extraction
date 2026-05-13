@@ -1,12 +1,15 @@
+import re
 from pathlib import Path
 from typing import Union
 import fitz
-# import pytesseract
-# from PIL import Image
-# import io
 
 
 def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
+    text, _ = extract(pdf_input)
+    return text
+
+
+def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
     if isinstance(pdf_input, bytes):
         doc = fitz.open(stream=pdf_input, filetype="pdf")
     else:
@@ -14,36 +17,71 @@ def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
         doc = fitz.open(str(pdf_path))
-    full_text = []
 
-    for page in doc:
+    page_count = doc.page_count
+    if page_count == 0:
+        doc.close()
+        return "", True
 
-        # --- Always extract digital ---
-        digital_text = _extract_digital_page(page)
+    full_text: list[str] = []
+    cv_pages_flagged = 0
+    cv_page_limit = 2
 
-        # # --- Decide if OCR is needed ---
-        # image_list = page.get_images(full=True)
-        # needs_ocr = bool(image_list) or len(digital_text.strip()) < 50
+    for page_num, page in enumerate(doc):
+        # Single get_text("words") call — shared by extraction and scoring
+        all_words = page.get_text("words")
 
-        # ocr_text = ""
-        # if needs_ocr:
-        #     ocr_text = _extract_scanned_page(page)
+        page_text = _extract_digital_page(page, all_words)
+        full_text.append(page_text)
 
-        # # --- Merge ---
-        # combined = digital_text
-        # if ocr_text.strip():
-        #     combined += "\n[OCR]\n" + ocr_text
+        if page_num < cv_page_limit:
+            word_count = len(all_words)
+            ocr_score = 0
+            page_fonts = doc.get_page_fonts(page_num)
+            # CIDFont+F<n> are generic wrapper fonts injected by scan/OCR tools, not real embedded text fonts
+            has_real_fonts = any(
+                not re.match(r'^CIDFont\+F\d+$', f[3])
+                for f in page_fonts if f[3]
+            )
 
-        full_text.append(f"{digital_text}")
+            if word_count < 30:
+                ocr_score += 40
+
+            if not page_fonts:
+                ocr_score += 30
+
+            page_area = page.rect.width * page.rect.height
+            if page_area > 0 and not has_real_fonts:
+                image_area = sum(
+                    fitz.Rect(info["bbox"]).width * fitz.Rect(info["bbox"]).height
+                    for info in page.get_image_info()
+                )
+                if image_area / page_area > 0.8:
+                    ocr_score += 30
+
+            if word_count > 0:
+                if sum(len(w[4]) for w in all_words) / word_count > 25:
+                    ocr_score += 20
+
+            if page_text:
+                garbage = sum(
+                    1 for c in page_text
+                    if (ord(c) < 32 and c not in "\n\t\r") or (127 <= ord(c) <= 159)
+                )
+                if garbage / len(page_text) > 0.4:
+                    ocr_score += 40
+
+            if ocr_score >= 50:
+                cv_pages_flagged += 1
 
     doc.close()
-    return "\n".join(full_text)
+    return "\n".join(full_text).strip(), cv_pages_flagged > 0
 
 
-# -------------------------------
-# DIGITAL PDF (your existing logic)
-# -------------------------------
-def _extract_digital_page(page) -> str:
+def _extract_digital_page(page, all_words: list | None = None) -> str:
+    if all_words is None:
+        all_words = page.get_text("words")
+
     page_text = []
 
     uri_rects = []
@@ -68,8 +106,9 @@ def _extract_digital_page(page) -> str:
             continue
 
         block_rect = fitz.Rect(block[:4])
+        # Filter from pre-fetched words instead of calling get_text per block
         words = sorted(
-            page.get_text("words", clip=block_rect),
+            [w for w in all_words if fitz.Rect(w[:4]).intersects(block_rect)],
             key=lambda w: (w[5], w[6], w[7])
         )
 
@@ -93,13 +132,3 @@ def _extract_digital_page(page) -> str:
             page_text.append(" ".join(line_parts))
 
     return "\n".join(page_text)
-
-
-# -------------------------------
-# SCANNED PDF (OCR)
-# -------------------------------
-# def _extract_scanned_page(page) -> str:
-#     pix = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72))
-#     img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-#     return pytesseract.image_to_string(img)
