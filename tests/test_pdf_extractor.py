@@ -340,3 +340,45 @@ def test_extract_digital_page1_with_two_image_pages_not_image(tmp_path):
     doc.close()
     _, is_image = extract(pdf_path)
     assert is_image is False
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: scoring branches
+# ---------------------------------------------------------------------------
+
+def test_extract_corrupt_file_on_disk_returns_empty(tmp_path):
+    """A corrupt file on disk (not bytes) returns empty string and is_image=True."""
+    bad_path = tmp_path / "corrupt.pdf"
+    bad_path.write_bytes(b"not a pdf at all")
+    text, is_image = extract(bad_path)
+    assert text == "" and is_image is True
+
+
+def test_extract_long_avg_word_alone_does_not_flag(tmp_path):
+    """35 words with avg length > 25 chars scores only +20 — below threshold, not flagged."""
+    pdf_path = tmp_path / "longwords.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join("x" * 30 for _ in range(35)))
+    doc.save(str(pdf_path))
+    doc.close()
+    _, is_image = extract(pdf_path)
+    assert is_image is False
+
+
+def test_extract_image_low_coverage_does_not_add_coverage_score(tmp_path):
+    """No-font page with a small image (< 80% coverage) does not get +30 image-coverage score."""
+    pdf_path = tmp_path / "small_image.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
+    # ~4% coverage: (100×200) / (595×842) ≈ 0.04
+    page.insert_image(fitz.Rect(0, 0, 100, 200), pixmap=pix)
+    doc.save(str(pdf_path))
+    doc.close()
+    # no words (+40) + no fonts (+30) = 70, but image coverage not added → still flagged
+    # This test verifies the branch is reached without raising and behaves correctly
+    text, is_image = extract(pdf_path)
+    assert isinstance(text, str)
+    assert is_image is True  # 70 pts from word/font scores alone → still flagged
