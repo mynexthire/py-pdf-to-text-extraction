@@ -1,49 +1,125 @@
+import logging
+import re
 from pathlib import Path
 from typing import Union
 import fitz
-# import pytesseract
-# from PIL import Image
-# import io
+
+_log = logging.getLogger(__name__)
+
+_CIDFONT_RE = re.compile(r'^CIDFont\+F\d+$')
+
+_CV_PAGE_LIMIT = 2
+_WORD_COUNT_THRESHOLD = 30
+_IMAGE_COVERAGE_THRESHOLD = 0.8
+_AVG_WORD_LEN_THRESHOLD = 25
+_GARBAGE_CHAR_RATIO_THRESHOLD = 0.4
+_OCR_SCORE_THRESHOLD = 50
+_MIN_USABLE_WORD_COUNT = 100
+
+_SCORE_LOW_WORD_COUNT = 40
+_SCORE_NO_FONTS = 30
+_SCORE_HIGH_IMAGE_COVERAGE = 30
+_SCORE_LONG_AVG_WORD = 20
+_SCORE_HIGH_GARBAGE = 40
 
 
 def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
+    text, _ = extract(pdf_input)
+    return text
+
+
+def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
     if isinstance(pdf_input, bytes):
-        doc = fitz.open(stream=pdf_input, filetype="pdf")
+        try:
+            doc = fitz.open(stream=pdf_input, filetype="pdf")
+        except Exception as exc:
+            _log.debug("failed to open PDF from bytes: %s", exc)
+            return "", True
     else:
         pdf_path = Path(pdf_input)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
-        doc = fitz.open(str(pdf_path))
-    full_text = []
+        try:
+            doc = fitz.open(str(pdf_path))
+        except Exception as exc:
+            _log.debug("failed to open PDF %s: %s", pdf_path, exc)
+            return "", True
 
-    for page in doc:
+    page_count = doc.page_count
+    if page_count == 0:
+        doc.close()
+        return "", True
 
-        # --- Always extract digital ---
-        digital_text = _extract_digital_page(page)
+    full_text: list[str] = []
+    cv_pages_flagged = 0
 
-        # # --- Decide if OCR is needed ---
-        # image_list = page.get_images(full=True)
-        # needs_ocr = bool(image_list) or len(digital_text.strip()) < 50
+    for page_num, page in enumerate(doc):
+        all_words = page.get_text("words")
 
-        # ocr_text = ""
-        # if needs_ocr:
-        #     ocr_text = _extract_scanned_page(page)
+        page_text = _extract_digital_page(page, all_words)
+        full_text.append(page_text)
 
-        # # --- Merge ---
-        # combined = digital_text
-        # if ocr_text.strip():
-        #     combined += "\n[OCR]\n" + ocr_text
+        if page_num < _CV_PAGE_LIMIT:
+            word_count = len(all_words)
+            ocr_score = 0
+            page_fonts = doc.get_page_fonts(page_num)
 
-        full_text.append(f"{digital_text}")
+            if word_count < _WORD_COUNT_THRESHOLD:
+                ocr_score += _SCORE_LOW_WORD_COUNT
+
+            if page_fonts:
+                # CIDFont+F<n> are generic wrapper fonts injected by scan/OCR tools, not real embedded text fonts
+                has_real_fonts = any(
+                    not _CIDFONT_RE.match(f[3])
+                    for f in page_fonts if f[3]
+                )
+            else:
+                has_real_fonts = False
+                ocr_score += _SCORE_NO_FONTS
+
+            page_area = page.rect.width * page.rect.height
+            if page_area > 0 and not has_real_fonts:
+                image_area = 0.0
+                for info in page.get_image_info():
+                    r = fitz.Rect(info["bbox"])
+                    image_area += r.width * r.height
+                if image_area / page_area > _IMAGE_COVERAGE_THRESHOLD:
+                    ocr_score += _SCORE_HIGH_IMAGE_COVERAGE
+
+            if word_count > 0:
+                if sum(len(w[4]) for w in all_words) / word_count > _AVG_WORD_LEN_THRESHOLD:
+                    ocr_score += _SCORE_LONG_AVG_WORD
+
+            if page_text:
+                garbage = sum(
+                    1 for c in page_text
+                    if (ord(c) < 32 and c not in "\n\t\r") or (127 <= ord(c) <= 159)
+                )
+                if garbage / len(page_text) > _GARBAGE_CHAR_RATIO_THRESHOLD:
+                    ocr_score += _SCORE_HIGH_GARBAGE
+
+            if ocr_score >= _OCR_SCORE_THRESHOLD:
+                cv_pages_flagged += 1
 
     doc.close()
-    return "\n".join(full_text)
+
+    extracted = "\n".join(full_text).strip()
+
+    # All checked pages must be flagged — a single image page (portfolio cover,
+    # certificate attachment) among digital pages should not mark the whole CV
+    if cv_pages_flagged >= min(_CV_PAGE_LIMIT, page_count):
+        # Even if flagged as image-based, enough extracted text means GenAI can still use it
+        if len(extracted.split()) >= _MIN_USABLE_WORD_COUNT:
+            return extracted, False
+        return extracted, True
+
+    return extracted, False
 
 
-# -------------------------------
-# DIGITAL PDF (your existing logic)
-# -------------------------------
-def _extract_digital_page(page) -> str:
+def _extract_digital_page(page, all_words: list[tuple] | None = None) -> str:
+    if all_words is None:
+        all_words = page.get_text("words")
+
     page_text = []
 
     uri_rects = []
@@ -59,6 +135,9 @@ def _extract_digital_page(page) -> str:
     )
     blocks = sorted(blocks, key=lambda b: (round(b[1] / 10), b[0]))
 
+    # Pre-build word rects once; reused for every block intersection check
+    word_rects = [(w, fitz.Rect(w[:4])) for w in all_words]
+
     for block in blocks:
         if block[6] != 0:
             continue
@@ -68,16 +147,15 @@ def _extract_digital_page(page) -> str:
             continue
 
         block_rect = fitz.Rect(block[:4])
-        words = sorted(
-            page.get_text("words", clip=block_rect),
-            key=lambda w: (w[5], w[6], w[7])
+        words_in_block = sorted(
+            [(w, wr) for w, wr in word_rects if wr.intersects(block_rect)],
+            key=lambda x: (x[0][5], x[0][6], x[0][7])
         )
 
-        line_map = {}
-        for x0, y0, x1, y1, word, block_no, line_no, word_no in words:
-            line_map.setdefault((block_no, line_no), []).append(
-                (word_no, word, fitz.Rect(x0, y0, x1, y1))
-            )
+        line_map: dict = {}
+        for w, wr in words_in_block:
+            x0, y0, x1, y1, word, block_no, line_no, word_no = w
+            line_map.setdefault((block_no, line_no), []).append((word_no, word, wr))
 
         for key in sorted(line_map.keys()):
             line_parts = []
@@ -93,13 +171,3 @@ def _extract_digital_page(page) -> str:
             page_text.append(" ".join(line_parts))
 
     return "\n".join(page_text)
-
-
-# -------------------------------
-# SCANNED PDF (OCR)
-# -------------------------------
-# def _extract_scanned_page(page) -> str:
-#     pix = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72))
-#     img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-#     return pytesseract.image_to_string(img)
