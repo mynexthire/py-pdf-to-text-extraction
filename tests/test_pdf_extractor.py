@@ -10,12 +10,13 @@ from pdfExtractor import extract_text, extract
 
 @pytest.fixture
 def digital_pdf(tmp_path) -> Path:
-    """Simple digital PDF with known text content."""
+    """Simple digital PDF with known text content (≥ 100 words for final-verdict threshold)."""
     pdf_path = tmp_path / "test.pdf"
     doc = fitz.open()
     page = doc.new_page()
     page.insert_text((72, 72), "Hello World")
     page.insert_text((72, 100), "Second line of text")
+    page.insert_textbox(fitz.Rect(50, 130, 545, 700), " ".join(f"word{i}" for i in range(110)))
     doc.save(str(pdf_path))
     doc.close()
     return pdf_path
@@ -52,11 +53,11 @@ def image_pdf(tmp_path) -> Path:
 
 @pytest.fixture
 def rich_text_pdf(tmp_path) -> Path:
-    """PDF with 35 words per page — well above the 30-word scoring threshold."""
+    """PDF with 110 words — above both the 30-word scoring threshold and the 100-word final-verdict threshold."""
     pdf_path = tmp_path / "rich.pdf"
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    page.insert_textbox(fitz.Rect(50, 50, 545, 700), " ".join(f"word{i}" for i in range(110)))
     doc.save(str(pdf_path))
     doc.close()
     return pdf_path
@@ -256,11 +257,11 @@ def test_extract_image_based_with_enough_text_not_image(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_extract_portfolio_cover_plus_text_not_image(tmp_path):
-    """Digital page 1 + image page 2 → False."""
+    """Digital page 1 (110 words) + image page 2 → False."""
     pdf_path = tmp_path / "portfolio.pdf"
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    page.insert_textbox(fitz.Rect(50, 50, 545, 700), " ".join(f"word{i}" for i in range(110)))
     page = doc.new_page(width=595, height=842)
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
     pix.set_rect(pix.irect, (200, 200, 200))
@@ -276,7 +277,7 @@ def test_extract_image_page2_text_still_extracted(tmp_path):
     pdf_path = tmp_path / "mixed.pdf"
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    page.insert_textbox(fitz.Rect(50, 50, 545, 700), " ".join(f"word{i}" for i in range(110)))
     page = doc.new_page(width=595, height=842)
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
     pix.set_rect(pix.irect, (200, 200, 200))
@@ -309,12 +310,12 @@ def test_extract_image_page_beyond_limit_not_image(tmp_path):
 
 
 def test_extract_image_page_at_page3_not_image(tmp_path):
-    """2 digital pages + image page at page 3 → False."""
+    """2 digital pages (55 words each = 110 total) + image page at page 3 → False."""
     pdf_path = tmp_path / "cv_with_scanned_page3.pdf"
     doc = fitz.open()
     for _ in range(2):
         page = doc.new_page()
-        page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+        page.insert_textbox(fitz.Rect(50, 50, 545, 700), " ".join(f"word{i}" for i in range(55)))
     page = doc.new_page(width=595, height=842)
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
     pix.set_rect(pix.irect, (200, 200, 200))
@@ -326,11 +327,11 @@ def test_extract_image_page_at_page3_not_image(tmp_path):
 
 
 def test_extract_digital_page1_with_two_image_pages_not_image(tmp_path):
-    """1 digital page + 2 image pages → False."""
+    """1 digital page (110 words) + 2 image pages → False."""
     pdf_path = tmp_path / "mostly_image.pdf"
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join(f"word{i}" for i in range(35)))
+    page.insert_textbox(fitz.Rect(50, 50, 545, 700), " ".join(f"word{i}" for i in range(110)))
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
     pix.set_rect(pix.irect, (200, 200, 200))
     for _ in range(2):
@@ -355,11 +356,12 @@ def test_extract_corrupt_file_on_disk_returns_empty(tmp_path):
 
 
 def test_extract_long_avg_word_alone_does_not_flag(tmp_path):
-    """35 words with avg length > 25 chars scores only +20 — below threshold, not flagged."""
+    """Long words (avg > 25 chars) score only +20 per page — below threshold; 2 pages ensure ≥ 100 total words."""
     pdf_path = tmp_path / "longwords.pdf"
     doc = fitz.open()
-    page = doc.new_page()
-    page.insert_textbox(fitz.Rect(50, 50, 545, 500), " ".join("x" * 30 for _ in range(35)))
+    for _ in range(2):
+        page = doc.new_page()
+        page.insert_textbox(fitz.Rect(50, 50, 545, 700), " ".join("x" * 30 for _ in range(80)))
     doc.save(str(pdf_path))
     doc.close()
     _, is_image = extract(pdf_path)
