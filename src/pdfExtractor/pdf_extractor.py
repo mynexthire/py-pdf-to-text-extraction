@@ -142,12 +142,10 @@ def extract(
                 is_page_image_based = True
 
             if is_page_image_based and ocr and _OCR_AVAILABLE and ocr_budget > 0:
-                current_words = len(" ".join(full_text).split())
-                if current_words < _MIN_USABLE_WORD_COUNT:
-                    ocr_text = _ocr_page(page, lang=ocr_lang, dpi=ocr_dpi)
-                    ocr_budget -= 1
-                    if len(ocr_text.split()) >= _OCR_MIN_WORDS:
-                        page_text = ocr_text
+                ocr_text = _ocr_page(page, lang=ocr_lang, dpi=ocr_dpi)
+                ocr_budget -= 1
+                if len(ocr_text.split()) >= _OCR_MIN_WORDS:
+                    page_text = ocr_text
 
             full_text.append(page_text)
 
@@ -156,9 +154,6 @@ def extract(
         # All checked pages must be flagged — a single image page (portfolio cover,
         # certificate attachment) among digital pages should not mark the whole CV
         if cv_pages_flagged >= min(_CV_PAGE_LIMIT, page_count):
-            # Even if flagged as image-based, enough extracted text means GenAI can still use it
-            if len(extracted.split()) >= _MIN_USABLE_WORD_COUNT:
-                return extracted, False
             return extracted, True
 
         # Final verdict: image-bearing PDF with too little extractable text → needs OCR

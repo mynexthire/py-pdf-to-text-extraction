@@ -494,13 +494,13 @@ def test_extract_ocr_text_discarded_when_below_min_words(image_pdf):
     assert is_image is True
 
 
-def test_extract_ocr_enough_words_sets_is_image_false(image_pdf):
-    """OCR that yields >= _MIN_USABLE_WORD_COUNT words makes is_image False."""
-    rich = " ".join(f"word{i}" for i in range(120))  # 120 >= 100
+def test_extract_ocr_image_flag_stays_true_even_when_text_recovered(image_pdf):
+    """is_image stays True after OCR — the document IS image-based regardless of recovery."""
+    rich = " ".join(f"word{i}" for i in range(120))
     with patch.object(_m, '_OCR_AVAILABLE', True), \
          patch.object(_m, '_ocr_page', return_value=rich):
         _, is_image = extract(image_pdf)
-    assert is_image is False
+    assert is_image is True
 
 
 def test_extract_ocr_budget_limits_calls(scanned_pdf):
@@ -511,8 +511,8 @@ def test_extract_ocr_budget_limits_calls(scanned_pdf):
     assert mock_ocr.call_count <= _m._OCR_BUDGET
 
 
-def test_extract_ocr_skips_once_enough_words_accumulated(tmp_path):
-    """Second page is not OCR'd once the first already yielded >= _MIN_USABLE_WORD_COUNT words."""
+def test_extract_ocr_runs_on_all_image_pages_within_budget(tmp_path):
+    """Every image-based page gets OCR'd — no early exit based on accumulated word count."""
     pdf_path = tmp_path / "two_scanned.pdf"
     doc = fitz.open()
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
@@ -523,11 +523,11 @@ def test_extract_ocr_skips_once_enough_words_accumulated(tmp_path):
     doc.save(str(pdf_path))
     doc.close()
 
-    rich = " ".join(f"word{i}" for i in range(120))  # single call exceeds threshold
+    rich = " ".join(f"word{i}" for i in range(120))
     with patch.object(_m, '_OCR_AVAILABLE', True), \
          patch.object(_m, '_ocr_page', return_value=rich) as mock_ocr:
         extract(pdf_path)
-    assert mock_ocr.call_count == 1
+    assert mock_ocr.call_count == 2
 
 
 def test_extract_ocr_lang_and_dpi_forwarded(image_pdf):
@@ -597,7 +597,7 @@ def test_vector_pdf_is_flagged_for_ocr(vector_pdf):
          patch.object(_m, '_ocr_page', return_value=rich) as mock_ocr:
         _, is_image = extract(vector_pdf)
     mock_ocr.assert_called()
-    assert is_image is False
+    assert is_image is True
 
 
 def test_vector_pdf_ocr_recovers_text(vector_pdf):
