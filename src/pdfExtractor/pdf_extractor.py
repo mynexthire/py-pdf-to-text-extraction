@@ -21,9 +21,23 @@ _SCORE_NO_FONTS = 30
 _SCORE_HIGH_IMAGE_COVERAGE = 30
 _SCORE_LONG_AVG_WORD = 20
 _SCORE_HIGH_GARBAGE = 40
+_SCORE_HIGH_DRAWINGS = 20
+_HIGH_DRAWING_COUNT = 500
+
+_OCR_DPI = 200
+_OCR_MIN_WORDS = 10
+_OCR_BUDGET = 3
+_OCR_LANG = "eng"
 
 # Shared flags for both word and block extraction so a single textpage is reused
 _EXTRACT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES
+
+try:
+    import pytesseract
+    from PIL import Image
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
 
 
 def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
@@ -31,7 +45,13 @@ def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
     return text
 
 
-def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
+def extract(
+    pdf_input: Union[bytes, Path, str],
+    *,
+    ocr: bool = True,
+    ocr_lang: str = _OCR_LANG,
+    ocr_dpi: int = _OCR_DPI,
+) -> tuple[str, bool]:
     if isinstance(pdf_input, bytes):
         try:
             doc = fitz.open(stream=pdf_input, filetype="pdf")
@@ -56,6 +76,7 @@ def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
         full_text: list[str] = []
         cv_pages_flagged = 0
         has_any_image = False
+        ocr_budget = _OCR_BUDGET
 
         for page_num, page in enumerate(doc):
             # One textpage build shared by both word and block extraction
@@ -64,10 +85,10 @@ def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
             all_blocks = page.get_text("blocks", textpage=tp)
 
             page_text = _extract_digital_page(page, all_words, all_blocks)
-            full_text.append(page_text)
             if not has_any_image and page.get_image_info():
                 has_any_image = True
 
+            is_page_image_based = False
             if page_num < _CV_PAGE_LIMIT:
                 word_count = len(all_words)
                 ocr_score = 0
@@ -88,7 +109,7 @@ def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
 
                 pr = page.rect
                 page_area = (pr.x1 - pr.x0) * (pr.y1 - pr.y0)
-                if page_area > 0 and not has_real_fonts:
+                if page_area > 0:
                     image_area = 0.0
                     for info in page.get_image_info():
                         x0, y0, x1, y1 = info["bbox"]
@@ -108,8 +129,27 @@ def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
                     if garbage / len(page_text) > _GARBAGE_CHAR_RATIO_THRESHOLD:
                         ocr_score += _SCORE_HIGH_GARBAGE
 
+                # Vector-design CVs (Illustrator/Figma exports) store content as paths, not text or images.
+                # Hundreds of drawings with few extractable words is the reliable signal.
+                if len(page.get_drawings()) > _HIGH_DRAWING_COUNT:
+                    ocr_score += _SCORE_HIGH_DRAWINGS
+
                 if ocr_score >= _OCR_SCORE_THRESHOLD:
                     cv_pages_flagged += 1
+                    is_page_image_based = True
+            elif cv_pages_flagged >= min(_CV_PAGE_LIMIT, page_count):
+                # All checked pages were image-based → treat remaining pages the same
+                is_page_image_based = True
+
+            if is_page_image_based and ocr and _OCR_AVAILABLE and ocr_budget > 0:
+                current_words = len(" ".join(full_text).split())
+                if current_words < _MIN_USABLE_WORD_COUNT:
+                    ocr_text = _ocr_page(page, lang=ocr_lang, dpi=ocr_dpi)
+                    ocr_budget -= 1
+                    if len(ocr_text.split()) >= _OCR_MIN_WORDS:
+                        page_text = ocr_text
+
+            full_text.append(page_text)
 
         extracted = "\n".join(full_text).strip()
 
@@ -129,6 +169,20 @@ def extract(pdf_input: Union[bytes, Path, str]) -> tuple[str, bool]:
 
     finally:
         doc.close()
+
+
+def _ocr_page(page, lang: str = _OCR_LANG, dpi: int = _OCR_DPI) -> str:
+    if not _OCR_AVAILABLE:
+        return ""
+    try:
+        # Render grayscale and feed the buffer directly — skips a PNG encode/decode round-trip.
+        # Tesseract binarizes internally so grayscale costs no accuracy.
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        return pytesseract.image_to_string(img, lang=lang, config="--psm 6").strip()
+    except Exception as exc:
+        _log.warning("OCR failed on page %s: %s", page.number, exc)
+        return ""
 
 
 def _extract_digital_page(
