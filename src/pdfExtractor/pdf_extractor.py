@@ -83,6 +83,7 @@ def extract(
             tp = page.get_textpage(flags=_EXTRACT_FLAGS)
             all_words = page.get_text("words", textpage=tp)
             all_blocks = page.get_text("blocks", textpage=tp)
+            del tp  # all_words/all_blocks are plain Python lists; release C-level TextPage now
 
             page_text = _extract_digital_page(page, all_words, all_blocks)
             if not has_any_image and page.get_image_info():
@@ -169,15 +170,21 @@ def extract(
 def _ocr_page(page, lang: str = _OCR_LANG, dpi: int = _OCR_DPI) -> str:
     if not _OCR_AVAILABLE:
         return ""
+    # Render grayscale and feed the buffer directly — skips a PNG encode/decode round-trip.
+    # Tesseract binarizes internally so grayscale costs no accuracy.
+    pix = None
     try:
-        # Render grayscale and feed the buffer directly — skips a PNG encode/decode round-trip.
-        # Tesseract binarizes internally so grayscale costs no accuracy.
         pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
         img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        del pix
+        pix = None
         return pytesseract.image_to_string(img, lang=lang, config="--psm 6").strip()
     except Exception as exc:
         _log.warning("OCR failed on page %s: %s", page.number, exc)
         return ""
+    finally:
+        if pix is not None:
+            del pix
 
 
 def _extract_digital_page(
