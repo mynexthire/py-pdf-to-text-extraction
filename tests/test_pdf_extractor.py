@@ -414,7 +414,8 @@ def ocr_env():
     mock_image_cls = MagicMock()
     with patch.object(_m, '_OCR_AVAILABLE', True), \
          patch.object(_m, 'pytesseract', mock_tess, create=True), \
-         patch.object(_m, 'Image', mock_image_cls, create=True):
+         patch.object(_m, 'Image', mock_image_cls, create=True), \
+         patch.object(_m, 'ImageOps', MagicMock(), create=True):
         yield mock_tess, mock_image_cls
 
 
@@ -431,31 +432,74 @@ def _mock_page():
 # _ocr_page() unit tests
 # ---------------------------------------------------------------------------
 
+def _tess_data(words, confs=None, gaps=None):
+    """Build an image_to_data DICT for one line of words.
+
+    gaps[i] is the pixel gap between word i and word i+1 (default: normal
+    word spacing well under the bullet-glyph threshold).
+    """
+    n = len(words)
+    confs = confs if confs is not None else [95.0] * n
+    gaps = gaps if gaps is not None else [4] * max(0, n - 1)
+    lefts, x = [], 0
+    for i in range(n):
+        lefts.append(x)
+        x += 50 + (gaps[i] if i < len(gaps) else 4)
+    return {
+        "text": list(words), "conf": confs,
+        "block_num": [1] * n, "par_num": [1] * n, "line_num": [1] * n,
+        "word_num": list(range(1, n + 1)),
+        "left": lefts, "top": [0] * n, "width": [50] * n, "height": [12] * n,
+    }
+
+
 def test_ocr_page_unavailable_returns_empty():
     with patch.object(_m, '_OCR_AVAILABLE', False):
         assert _m._ocr_page(_mock_page()) == ""
 
 
-def test_ocr_page_strips_whitespace(ocr_env):
+def test_ocr_page_joins_words(ocr_env):
     mock_tess, _ = ocr_env
-    mock_tess.image_to_string.return_value = "  hello world  \n"
+    mock_tess.image_to_data.return_value = _tess_data(["hello", "world"])
     assert _m._ocr_page(_mock_page()) == "hello world"
 
 
-def test_ocr_page_renders_grayscale_at_requested_dpi(ocr_env):
+def test_ocr_page_renders_rgb_at_requested_dpi(ocr_env):
     mock_tess, _ = ocr_env
-    mock_tess.image_to_string.return_value = ""
+    mock_tess.image_to_data.return_value = _tess_data([])
     page = _mock_page()
     _m._ocr_page(page, dpi=150)
-    page.get_pixmap.assert_called_once_with(dpi=150, colorspace=fitz.csGRAY)
+    page.get_pixmap.assert_called_once_with(dpi=150, colorspace=fitz.csRGB)
 
 
 def test_ocr_page_passes_lang_to_tesseract(ocr_env):
     mock_tess, _ = ocr_env
-    mock_tess.image_to_string.return_value = ""
+    mock_tess.image_to_data.return_value = _tess_data([])
     _m._ocr_page(_mock_page(), lang="hin")
-    _, call_kwargs = mock_tess.image_to_string.call_args
+    _, call_kwargs = mock_tess.image_to_data.call_args
     assert call_kwargs["lang"] == "hin"
+
+
+def test_ocr_page_drops_low_confidence_words(ocr_env):
+    mock_tess, _ = ocr_env
+    mock_tess.image_to_data.return_value = _tess_data(
+        ["hello", "YAO)", "world"], confs=[95.0, 0.0, 95.0])
+    assert _m._ocr_page(_mock_page()) == "hello world"
+
+
+def test_ocr_page_drops_leading_bullet_glyph(ocr_env):
+    mock_tess, _ = ocr_env
+    # 'e' bullet: <=2 chars leading a line, gap 3x the glyph height
+    mock_tess.image_to_data.return_value = _tess_data(
+        ["e", "Conducted", "tests"], gaps=[36, 4])
+    assert _m._ocr_page(_mock_page()) == "Conducted tests"
+
+
+def test_ocr_page_keeps_normal_short_leading_word(ocr_env):
+    mock_tess, _ = ocr_env
+    # 'I' starting a line with normal spacing must NOT be treated as a bullet
+    mock_tess.image_to_data.return_value = _tess_data(["I", "can", "apply"])
+    assert _m._ocr_page(_mock_page()) == "I can apply"
 
 
 def test_ocr_page_exception_returns_empty(ocr_env):
@@ -467,6 +511,44 @@ def test_ocr_page_exception_returns_empty(ocr_env):
 # ---------------------------------------------------------------------------
 # extract() — OCR integration tests
 # ---------------------------------------------------------------------------
+
+def test_digital_text_usable_thresholds():
+    healthy = [(0, 0, 1, 1, f"word{i}") for i in range(40)]
+    assert _m._digital_text_usable("normal text " * 40, healthy)
+    # too few words
+    assert not _m._digital_text_usable("normal text", healthy[:5])
+    # shattered encoding: absurd average word length
+    long_words = [(0, 0, 1, 1, "x" * 40) for _ in range(40)]
+    assert not _m._digital_text_usable("x" * 1600, long_words)
+    # garbage control characters dominate the text
+    garbage_text = ("\x01\x02\x03" * 40) + ("ok " * 20)
+    assert not _m._digital_text_usable(garbage_text, healthy)
+
+
+def test_extract_skips_ocr_when_flagged_page_has_usable_text(tmp_path):
+    """A page flagged by layout signals (image coverage + drawings) must keep
+    its healthy digital text instead of being OCR-replaced."""
+    pdf_path = tmp_path / "designed.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10))
+    pix.set_rect(pix.irect, (200, 200, 200))
+    page.insert_image(fitz.Rect(0, 0, 550, 800), pixmap=pix)  # coverage > 0.8 -> +30
+    for i in range(501):                                       # drawings > 500 -> +20
+        x = 10 + (i % 50) * 11
+        y = 750 + (i // 50) * 10
+        page.draw_line(fitz.Point(x, y), fitz.Point(x + 5, y))
+    page.insert_textbox(fitz.Rect(50, 50, 545, 700),
+                        " ".join(f"word{i}" for i in range(110)))
+    doc.save(str(pdf_path))
+    doc.close()
+
+    with patch.object(_m, '_OCR_AVAILABLE', True), \
+         patch.object(_m, '_ocr_page', return_value="ocr " * 50) as mock_ocr:
+        text, _ = _m.extract(pdf_path)
+    mock_ocr.assert_not_called()
+    assert "word0" in text and "ocr" not in text
+
 
 def test_extract_ocr_false_never_calls_ocr(image_pdf):
     """ocr=False must bypass OCR even when the page is image-based."""
