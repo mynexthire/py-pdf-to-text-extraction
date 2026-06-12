@@ -17,6 +17,7 @@ _OCR_SCORE_THRESHOLD = 50
 _MIN_USABLE_WORD_COUNT = 100
 
 _SCORE_LOW_WORD_COUNT = 40
+_SCORE_ZERO_WORDS = 50       # a wordless page can only yield text via OCR — flag outright
 _SCORE_NO_FONTS = 30
 _SCORE_HIGH_IMAGE_COVERAGE = 30
 _SCORE_LONG_AVG_WORD = 20
@@ -24,17 +25,22 @@ _SCORE_HIGH_GARBAGE = 40
 _SCORE_HIGH_DRAWINGS = 20
 _HIGH_DRAWING_COUNT = 500
 
-_OCR_DPI = 200
+_OCR_DPI = 300               # 300 beats 200 by ~3.5 mean-confidence points on the CV corpus
 _OCR_MIN_WORDS = 10
 _OCR_BUDGET = 3
 _OCR_LANG = "eng"
+_OCR_PSM = "--psm 4"         # single column, variable sizes — recovers name headers psm 6 splits
+_OCR_MIN_CONF = 20           # decorative glyphs OCR at conf ~0; real words rarely drop below ~25
+_OCR_BULLET_GAP_RATIO = 1.5  # leading <=2-char word with gap > ratio x height = bullet glyph, not text
+_OCR_COLUMN_SAMPLES = 40     # vertical strips to probe when hunting for a column gutter
+_OCR_GUTTER_THRESHOLD = 0.15 # gutter must have < 15% of the darkest strip's pixel count
 
 # Shared flags for both word and block extraction so a single textpage is reused
 _EXTRACT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES
 
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image, ImageOps
     _OCR_AVAILABLE = True
 except ImportError:
     _OCR_AVAILABLE = False
@@ -76,6 +82,7 @@ def extract(
         full_text: list[str] = []
         cv_pages_flagged = 0
         has_any_image = False
+        digital_word_total = 0
         ocr_budget = _OCR_BUDGET
 
         for page_num, page in enumerate(doc):
@@ -86,7 +93,11 @@ def extract(
             del tp  # all_words/all_blocks are plain Python lists; release C-level TextPage now
 
             page_text = _extract_digital_page(page, all_words, all_blocks)
-            if not has_any_image and page.get_image_info():
+            digital_word_total += len(all_words)
+            # get_images() enumerates image xrefs without decoding them —
+            # scans with corrupt image streams (zlib errors) come back empty
+            # from get_image_info() and would otherwise read as image-free
+            if not has_any_image and page.get_images():
                 has_any_image = True
 
             is_page_image_based = False
@@ -95,7 +106,9 @@ def extract(
                 ocr_score = 0
                 page_fonts = doc.get_page_fonts(page_num)
 
-                if word_count < _WORD_COUNT_THRESHOLD:
+                if word_count == 0:
+                    ocr_score += _SCORE_ZERO_WORDS
+                elif word_count < _WORD_COUNT_THRESHOLD:
                     ocr_score += _SCORE_LOW_WORD_COUNT
 
                 if page_fonts:
@@ -106,6 +119,7 @@ def extract(
                     )
                 else:
                     has_real_fonts = False
+                if not has_real_fonts:
                     ocr_score += _SCORE_NO_FONTS
 
                 pr = page.rect
@@ -142,7 +156,12 @@ def extract(
                 # All checked pages were image-based → treat remaining pages the same
                 is_page_image_based = True
 
-            if is_page_image_based and ocr and _OCR_AVAILABLE and ocr_budget > 0:
+            # Layout signals (image coverage, drawings) can flag pages that
+            # still carry healthy digital text — OCR would replace good text
+            # with an approximation and burn seconds. Only OCR when the
+            # digital text is genuinely unusable.
+            if (is_page_image_based and ocr and _OCR_AVAILABLE and ocr_budget > 0
+                    and not _digital_text_usable(page_text, all_words)):
                 ocr_text = _ocr_page(page, lang=ocr_lang, dpi=ocr_dpi)
                 ocr_budget -= 1
                 if len(ocr_text.split()) >= _OCR_MIN_WORDS:
@@ -155,6 +174,10 @@ def extract(
         # All checked pages must be flagged — a single image page (portfolio cover,
         # certificate attachment) among digital pages should not mark the whole CV
         if cv_pages_flagged >= min(_CV_PAGE_LIMIT, page_count):
+            # Portfolios and vector-design CVs can flag both checked pages on
+            # layout signals while later pages carry plenty of real digital text
+            if digital_word_total >= _MIN_USABLE_WORD_COUNT:
+                return extracted, False
             return extracted, True
 
         # Final verdict: image-bearing PDF with too little extractable text → needs OCR
@@ -165,26 +188,167 @@ def extract(
 
     finally:
         doc.close()
+        # MuPDF keeps a process-wide resource store (decoded images, glyphs,
+        # ~256 MB default ceiling) that survives doc.close(). Cross-document
+        # reuse is worthless for one-shot CV extraction, and in long-running
+        # services the store reads as a ~10 MB/call leak on the OCR path.
+        fitz.TOOLS.store_shrink(100)
+
+
+def _digital_text_usable(page_text: str, all_words: list) -> bool:
+    """True when a page's extractable text is healthy enough to keep as-is.
+
+    Mirrors the text-quality scoring signals (word count, average word length,
+    garbage-character ratio) — but not the layout signals, which justify
+    flagging a page image-based without implying its text is bad.
+    """
+    if len(all_words) < _WORD_COUNT_THRESHOLD:
+        return False
+    if sum(len(w[4]) for w in all_words) / len(all_words) > _AVG_WORD_LEN_THRESHOLD:
+        return False
+    if page_text:
+        garbage = sum(
+            1 for c in page_text
+            if (ord(c) < 32 and c not in "\n\t\r") or (127 <= ord(c) <= 159)
+        )
+        if garbage / len(page_text) > _GARBAGE_CHAR_RATIO_THRESHOLD:
+            return False
+    return True
+
+
+def _find_image_column_split(img) -> int | None:
+    """Return x pixel where a column gutter sits, or None for single-column pages.
+
+    Scans vertical strips across the middle 20-80% of the image width and picks
+    the strip with the fewest dark pixels — that's the gutter between columns.
+    Only returns a split when the gutter is significantly emptier than the content
+    columns (_OCR_GUTTER_THRESHOLD controls how empty "empty" must be).
+    """
+    width, height = img.size
+    search_start = int(width * 0.2)
+    search_end = int(width * 0.8)
+    strip_w = max(10, (search_end - search_start) // _OCR_COLUMN_SAMPLES)
+
+    counts, positions = [], []
+    for x in range(search_start, search_end, strip_w):
+        end_x = min(x + strip_w, width)
+        hist = img.crop((x, 0, end_x, height)).histogram()
+        dark = sum(hist[:128])  # pixel values 0-127 = dark content
+        counts.append(dark)
+        positions.append(x + strip_w // 2)
+
+    if not counts:
+        return None
+
+    min_dark = min(counts)
+    max_dark = max(counts)
+    if max_dark == 0 or min_dark >= max_dark * _OCR_GUTTER_THRESHOLD:
+        return None
+
+    return positions[counts.index(min_dark)]
+
+
+def _assemble_ocr_text(data: dict) -> str:
+    """Rebuild reading-order text from image_to_data output.
+
+    Drops words below _OCR_MIN_CONF (decorative graphics OCR as conf-0 garbage)
+    and leading bullet glyphs, which Tesseract reads as 'e'/'¢' but betray
+    themselves geometrically: a <=2-char first word followed by a gap far wider
+    than normal word spacing.
+    """
+    rows: dict = {}
+    order: list = []
+    for i in range(len(data["text"])):
+        word = data["text"][i].strip()
+        if not word or float(data["conf"][i]) < _OCR_MIN_CONF:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if key not in rows:
+            rows[key] = []
+            order.append(key)
+        rows[key].append(i)
+
+    pieces: list = []
+    prev_para = None
+    for key in order:
+        idxs = rows[key]
+        if len(idxs) >= 2:
+            first, second = idxs[0], idxs[1]
+            gap = data["left"][second] - (data["left"][first] + data["width"][first])
+            height = data["height"][first] or 1
+            if len(data["text"][first].strip()) <= 2 and gap > _OCR_BULLET_GAP_RATIO * height:
+                idxs = idxs[1:]
+        para = key[:2]
+        if prev_para is not None and para != prev_para:
+            pieces.append("")
+        pieces.append(" ".join(data["text"][i].strip() for i in idxs))
+        prev_para = para
+    return "\n".join(pieces).strip()
 
 
 def _ocr_page(page, lang: str = _OCR_LANG, dpi: int = _OCR_DPI) -> str:
     if not _OCR_AVAILABLE:
         return ""
-    # Render grayscale and feed the buffer directly — skips a PNG encode/decode round-trip.
-    # Tesseract binarizes internally so grayscale costs no accuracy.
     pix = None
     try:
-        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
-        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        # Render RGB — rendering grayscale at the MuPDF level loses
+        # white-on-color name headers
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         del pix
         pix = None
-        return pytesseract.image_to_string(img, lang=lang, config="--psm 6").strip()
+
+        # Luminance conversion must happen post-render: histogram()[:128] on
+        # an RGB image counts only the red band, skewing gutter detection
+        gray = img.convert("L")
+        img.close()
+
+        try:
+            split = _find_image_column_split(gray)
+        except Exception:
+            split = None
+
+        if split:
+            regions = [
+                gray.crop((0, 0, split, gray.height)),
+                gray.crop((split, 0, gray.width, gray.height)),
+            ]
+        else:
+            regions = [gray]
+
+        texts = []
+        for region in regions:
+            # Per-region autocontrast lifts low-contrast text (light-on-light
+            # headers) before Tesseract's internal binarization.
+            # image_to_data over image_to_string: same recognition pass, but
+            # exposes per-word confidence and boxes for garbage filtering.
+            data = pytesseract.image_to_data(
+                ImageOps.autocontrast(region), lang=lang, config=_OCR_PSM,
+                output_type=pytesseract.Output.DICT,
+            )
+            texts.append(_assemble_ocr_text(data))
+        return "\n".join(t for t in texts if t).strip()
+
     except Exception as exc:
         _log.warning("OCR failed on page %s: %s", page.number, exc)
         return ""
     finally:
         if pix is not None:
             del pix
+
+
+def _detect_column_split(text_blocks: list, page_width: float) -> float | None:
+    """Return x split point for two-column layout, or None if single column."""
+    x0_vals = sorted(set(round(b[0]) for b in text_blocks))
+    if len(x0_vals) < 2:
+        return None
+    max_gap, split = 0, None
+    for i in range(1, len(x0_vals)):
+        gap = x0_vals[i] - x0_vals[i - 1]
+        if gap > max_gap:
+            max_gap = gap
+            split = (x0_vals[i] + x0_vals[i - 1]) / 2
+    return split if max_gap > page_width * 0.1 else None
 
 
 def _extract_digital_page(
@@ -210,11 +374,17 @@ def _extract_digital_page(
                 r = link["from"]
                 uri_coords.append((r.x0, r.y0, r.x1, r.y1, uri))
 
-    blocks = sorted(all_blocks, key=lambda b: (round(b[1] / 10), b[0]))
+    text_blocks = [b for b in all_blocks if b[6] == 0]
+    split = _detect_column_split(text_blocks, page.rect.width)
+
+    if split is not None:
+        left = sorted([b for b in text_blocks if b[0] < split], key=lambda b: b[1])
+        right = sorted([b for b in text_blocks if b[0] >= split], key=lambda b: b[1])
+        blocks = left + right
+    else:
+        blocks = sorted(text_blocks, key=lambda b: (round(b[1] / 10), b[0]))
 
     for block in blocks:
-        if block[6] != 0:
-            continue
         block_text = block[4].strip()
         if not block_text:
             continue
