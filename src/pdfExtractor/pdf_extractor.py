@@ -106,6 +106,10 @@ def extract(
                 ocr_score = 0
                 page_fonts = doc.get_page_fonts(page_num)
 
+                # Cheap, data-already-in-hand signals first. The expensive page
+                # scans below (get_image_info / get_drawings) are only worth
+                # paying for when they could still tip the score past the
+                # threshold — a healthy digital page never reaches them.
                 if word_count == 0:
                     ocr_score += _SCORE_ZERO_WORDS
                 elif word_count < _WORD_COUNT_THRESHOLD:
@@ -122,16 +126,6 @@ def extract(
                 if not has_real_fonts:
                     ocr_score += _SCORE_NO_FONTS
 
-                pr = page.rect
-                page_area = (pr.x1 - pr.x0) * (pr.y1 - pr.y0)
-                if page_area > 0:
-                    image_area = 0.0
-                    for info in page.get_image_info():
-                        x0, y0, x1, y1 = info["bbox"]
-                        image_area += (x1 - x0) * (y1 - y0)
-                    if image_area / page_area > _IMAGE_COVERAGE_THRESHOLD:
-                        ocr_score += _SCORE_HIGH_IMAGE_COVERAGE
-
                 if word_count > 0:
                     if sum(len(w[4]) for w in all_words) / word_count > _AVG_WORD_LEN_THRESHOLD:
                         ocr_score += _SCORE_LONG_AVG_WORD
@@ -144,10 +138,29 @@ def extract(
                     if garbage / len(page_text) > _GARBAGE_CHAR_RATIO_THRESHOLD:
                         ocr_score += _SCORE_HIGH_GARBAGE
 
+                # Image coverage requires get_image_info() (decodes image geometry).
+                # Skip it once the page is already flagged — the extra points are
+                # never read, only the >= threshold decision is.
+                if ocr_score < _OCR_SCORE_THRESHOLD:
+                    pr = page.rect
+                    page_area = (pr.x1 - pr.x0) * (pr.y1 - pr.y0)
+                    if page_area > 0:
+                        image_area = 0.0
+                        for info in page.get_image_info():
+                            x0, y0, x1, y1 = info["bbox"]
+                            image_area += (x1 - x0) * (y1 - y0)
+                        if image_area / page_area > _IMAGE_COVERAGE_THRESHOLD:
+                            ocr_score += _SCORE_HIGH_IMAGE_COVERAGE
+
                 # Vector-design CVs (Illustrator/Figma exports) store content as paths, not text or images.
                 # Hundreds of drawings with few extractable words is the reliable signal.
-                if len(page.get_drawings()) > _HIGH_DRAWING_COUNT:
-                    ocr_score += _SCORE_HIGH_DRAWINGS
+                # get_drawings() parses the full content stream and is the most
+                # expensive call here — only run it when its +20 could actually
+                # reach the threshold (i.e. the score is already within 20 of it
+                # but not yet over). Normal digital pages sit at 0 and skip it.
+                if _OCR_SCORE_THRESHOLD - _SCORE_HIGH_DRAWINGS <= ocr_score < _OCR_SCORE_THRESHOLD:
+                    if len(page.get_drawings()) > _HIGH_DRAWING_COUNT:
+                        ocr_score += _SCORE_HIGH_DRAWINGS
 
                 if ocr_score >= _OCR_SCORE_THRESHOLD:
                     cv_pages_flagged += 1
@@ -384,20 +397,28 @@ def _extract_digital_page(
     else:
         blocks = sorted(text_blocks, key=lambda b: (round(b[1] / 10), b[0]))
 
+    # Bucket words by their native block number once (O(words)) instead of
+    # re-scanning every word against every block rect (O(blocks × words)).
+    # get_text("words") and get_text("blocks") share the same textpage block
+    # numbering, so a word's block_no (index 5) is exactly the block it belongs
+    # to. The old geometric intersection rediscovered that — but emitted a word
+    # once per block rect it overlapped, so stacked/overlapping blocks (e.g.
+    # enhancv CV templates) duplicated header text. Native block_no assigns each
+    # word to exactly one block, killing the duplication.
+    words_by_block: dict = {}
+    for w in all_words:
+        words_by_block.setdefault(w[5], []).append(w)
+
     for block in blocks:
         block_text = block[4].strip()
         if not block_text:
             continue
 
-        # Raw float intersection — eliminates fitz.Rect construction + .intersects() overhead
-        bx0, by0, bx1, by1 = block[0], block[1], block[2], block[3]
-
         line_map: dict = {}
-        for wx0, wy0, wx1, wy1, word, block_no, line_no, word_no in all_words:
-            if wx1 > bx0 and bx1 > wx0 and wy1 > by0 and by1 > wy0:
-                line_map.setdefault((block_no, line_no), []).append(
-                    (word_no, word, wx0, wy0, wx1, wy1)
-                )
+        for wx0, wy0, wx1, wy1, word, block_no, line_no, word_no in words_by_block.get(block[5], ()):
+            line_map.setdefault((block_no, line_no), []).append(
+                (word_no, word, wx0, wy0, wx1, wy1)
+            )
 
         for key in sorted(line_map.keys()):
             line_parts = []
