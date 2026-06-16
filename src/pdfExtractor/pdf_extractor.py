@@ -30,7 +30,7 @@ _OCR_MIN_WORDS = 10
 _OCR_BUDGET = 3
 _OCR_LANG = "eng"
 _OCR_PSM = "--psm 4"         # single column, variable sizes — recovers name headers psm 6 splits
-_OCR_MIN_CONF = 20           # decorative glyphs OCR at conf ~0; real words rarely drop below ~25
+no_OCR_MIN_CONF = 10           # decorative glyphs OCR at conf ~0; real words rarely drop below ~25
 _OCR_BULLET_GAP_RATIO = 1.5  # leading <=2-char word with gap > ratio x height = bullet glyph, not text
 _OCR_COLUMN_SAMPLES = 40     # vertical strips to probe when hunting for a column gutter
 _OCR_GUTTER_THRESHOLD = 0.15 # gutter must have < 15% of the darkest strip's pixel count
