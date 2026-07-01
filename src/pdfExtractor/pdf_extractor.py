@@ -37,6 +37,13 @@ _OCR_GUTTER_THRESHOLD = 0.15 # gutter must have < 15% of the darkest strip's pix
 
 # Shared flags for both word and block extraction so a single textpage is reused
 _EXTRACT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_PHONE_CANDIDATE_RE = re.compile(
+    r"(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,5}\)?[-.\s]?){1,4}\d{2,4}"
+)
+_PHONE_MIN_DIGITS = 10
+_PHONE_MAX_DIGITS = 13
+
 
 try:
     import pytesseract
@@ -50,6 +57,45 @@ def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
     text, _ = extract(pdf_input)
     return text
 
+
+def _find_phone(text: str) -> str | None:
+    """First substring whose digit count looks like a real phone number.
+
+    _PHONE_CANDIDATE_RE alone over-matches (dates, pin codes, ranges), so
+    every hit is normalized to digits-only and range-checked before accepting.
+    """
+    for m in _PHONE_CANDIDATE_RE.finditer(text):
+        digits = re.sub(r"\D", "", m.group(0))
+        if _PHONE_MIN_DIGITS <= len(digits) <= _PHONE_MAX_DIGITS:
+            return m.group(0).strip()
+    return None
+
+def _extract_contact_info(doc) -> str:
+    """OCR the first page and pull email/phone via regex, best effort.
+
+    Only called when page 0 wasn't already OCR'd in the main extraction
+    pass — page0_ocr_done guards against a redundant second OCR call on
+    the same page.
+    """
+    if doc.page_count == 0:
+        return ""
+    try:
+        ocr_text = _ocr_page(doc[0])
+    except Exception as exc:
+        _log.debug("contact OCR failed: %s", exc)
+        return ""
+    if not ocr_text:
+        return ""
+
+    email_match = _EMAIL_RE.search(ocr_text)
+    phone = _find_phone(ocr_text)
+
+    parts = []
+    if email_match:
+        parts.append(f"Email: {email_match.group(0)}")
+    if phone:
+        parts.append(f"Phone: {phone}")
+    return "\n".join(parts)
 
 def extract(
     pdf_input: Union[bytes, Path, str],
@@ -84,7 +130,7 @@ def extract(
         has_any_image = False
         digital_word_total = 0
         ocr_budget = _OCR_BUDGET
-
+        page0_ocr_done = False
         for page_num, page in enumerate(doc):
             # One textpage build shared by both word and block extraction
             tp = page.get_textpage(flags=_EXTRACT_FLAGS)
@@ -177,6 +223,8 @@ def extract(
                     and not _digital_text_usable(page_text, all_words)):
                 ocr_text = _ocr_page(page, lang=ocr_lang, dpi=ocr_dpi)
                 ocr_budget -= 1
+                if page_num == 0:
+                    page0_ocr_done = True
                 if len(ocr_text.split()) >= _OCR_MIN_WORDS:
                     page_text = ocr_text
 
@@ -196,6 +244,12 @@ def extract(
         # Final verdict: image-bearing PDF with too little extractable text → needs OCR
         if has_any_image and len(extracted.split()) < _WORD_COUNT_THRESHOLD:
             return extracted, True
+
+        if ocr and _OCR_AVAILABLE and not page0_ocr_done and not _EMAIL_RE.search(extracted):
+            contact_line = _extract_contact_info(doc)
+            if contact_line:
+                extracted = contact_line + "\n" + extracted
+                return extracted, True
 
         return extracted, False
 
