@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 import fitz
 from pathlib import Path
@@ -730,3 +733,81 @@ def test_ocr_page_caps_dpi_for_oversized_page(ocr_env):
     dpi = page.get_pixmap.call_args.kwargs["dpi"]
     assert dpi < 300
     assert (48 * dpi) ** 2 <= _m._OCR_MAX_PIXELS
+
+
+# ---------------------------------------------------------------------------
+# OCR slot — one document OCRing at a time per process
+# ---------------------------------------------------------------------------
+
+def _recording_ocr(order, peak, delay=0.02):
+    """_ocr_page stand-in that records which thread OCRs and how many overlap."""
+    lock = threading.Lock()
+    active = [0]
+
+    def fake(page, lang=None, dpi=None):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            order.append(threading.get_ident())
+        time.sleep(delay)
+        with lock:
+            active[0] -= 1
+        return "ocr word " * 20
+    return fake
+
+
+def test_concurrent_scans_ocr_one_document_at_a_time(scanned_pdf):
+    """Threads extracting scans never OCR together, and each document's pages run back to back."""
+    order, peak = [], [0]
+    with patch.object(_m, '_OCR_AVAILABLE', True), \
+         patch.object(_m, '_ocr_page', side_effect=_recording_ocr(order, peak)):
+        threads = [threading.Thread(target=_m.extract, args=(scanned_pdf,)) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert peak[0] == 1
+    assert len(order) == 3 * _m._OCR_BUDGET
+    switches = sum(1 for a, b in zip(order, order[1:]) if a != b)
+    assert switches == 2
+
+
+def test_digital_extraction_does_not_wait_for_busy_ocr(digital_pdf):
+    """Digital text comes back while another document holds the OCR slot; contact OCR is skipped."""
+    with patch.object(_m, '_OCR_AVAILABLE', True), \
+         patch.object(_m, '_CONTACT_OCR_WAIT_S', 0.05), \
+         patch.object(_m, '_extract_contact_info') as mock_contact, \
+         _m.ocr_slot():
+        started = time.perf_counter()
+        text, is_image = _m.extract(digital_pdf)
+        elapsed = time.perf_counter() - started
+    mock_contact.assert_not_called()
+    assert "Hello World" in text and is_image is False
+    assert elapsed < 1
+
+
+def test_scan_raises_busy_when_ocr_slot_stays_taken(scanned_pdf):
+    with patch.object(_m, '_OCR_AVAILABLE', True), \
+         patch.object(_m, '_OCR_QUEUE_WAIT_S', 0.05), \
+         patch.object(_m, '_ocr_page', return_value="ocr " * 20) as mock_ocr, \
+         _m.ocr_slot():
+        with pytest.raises(_m.OcrBusyError):
+            _m.extract(scanned_pdf)
+    mock_ocr.assert_not_called()
+
+
+def test_ocr_slot_released_when_ocr_raises(scanned_pdf):
+    with patch.object(_m, '_OCR_AVAILABLE', True), \
+         patch.object(_m, '_ocr_page', side_effect=RuntimeError("tesseract died")):
+        with pytest.raises(RuntimeError):
+            _m.extract(scanned_pdf)
+    assert _m._ocr_slot.acquire(blocking=False)
+    _m._ocr_slot.release()
+
+
+def test_ocr_slot_is_exported():
+    from pdfExtractor import OcrBusyError, ocr_slot
+    with ocr_slot(timeout=0.05):
+        with pytest.raises(OcrBusyError):
+            with ocr_slot(timeout=0.05):
+                pass

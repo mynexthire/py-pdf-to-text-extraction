@@ -1,5 +1,7 @@
 import logging
 import re
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Union
 import fitz
@@ -35,6 +37,16 @@ _OCR_MIN_CONF = 10           # decorative glyphs OCR at conf ~0; real words rare
 _OCR_BULLET_GAP_RATIO = 1.5  # leading <=2-char word with gap > ratio x height = bullet glyph, not text
 _OCR_COLUMN_SAMPLES = 40     # vertical strips to probe when hunting for a column gutter
 _OCR_GUTTER_THRESHOLD = 0.15 # gutter must have < 15% of the darkest strip's pixel count
+_OCR_QUEUE_WAIT_S = 40.0     # services calling this give up at ~60s; a CV's OCR fits in the rest
+_CONTACT_OCR_WAIT_S = 10.0   # contact OCR is best effort, not worth a long wait
+
+# One document OCRing at a time per process. A page render plus Tesseract peaks
+# at a few hundred MB and saturates a core, so a service extracting on several
+# threads would otherwise stack them until the kernel OOM-kills the worker.
+# Held across all of a document's OCR pages, so concurrent scans finish one
+# after another instead of all slowing down together. Digital text extraction
+# never takes it and stays fully parallel.
+_ocr_slot = threading.Semaphore(1)
 
 # Shared flags for both word and block extraction so a single textpage is reused
 _EXTRACT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES
@@ -52,6 +64,25 @@ try:
     _OCR_AVAILABLE = True
 except ImportError:
     _OCR_AVAILABLE = False
+
+
+class OcrBusyError(RuntimeError):
+    """No OCR slot freed up within the wait; the caller should retry later."""
+
+
+def _take_ocr_slot(timeout: float) -> None:
+    if not _ocr_slot.acquire(timeout=timeout):
+        raise OcrBusyError(f"OCR busy for {timeout:.0f}s")
+
+
+@contextmanager
+def ocr_slot(timeout: float = _OCR_QUEUE_WAIT_S):
+    """Hold the OCR slot extract() uses, so another OCR engine in the same process can share it."""
+    _take_ocr_slot(timeout)
+    try:
+        yield
+    finally:
+        _ocr_slot.release()
 
 
 def extract_text(pdf_input: Union[bytes, Path, str]) -> str:
@@ -121,6 +152,7 @@ def extract(
             _log.debug("failed to open PDF %s: %s", pdf_path, exc)
             return "", True
 
+    holds_ocr_slot = False
     try:
         page_count = doc.page_count
         if page_count == 0:
@@ -222,6 +254,9 @@ def extract(
             # digital text is genuinely unusable.
             if (is_page_image_based and ocr and _OCR_AVAILABLE and ocr_budget > 0
                     and not _digital_text_usable(page_text, all_words)):
+                if not holds_ocr_slot:
+                    _take_ocr_slot(_OCR_QUEUE_WAIT_S)
+                    holds_ocr_slot = True
                 ocr_text = _ocr_page(page, lang=ocr_lang, dpi=ocr_dpi)
                 ocr_budget -= 1
                 if page_num == 0:
@@ -247,7 +282,10 @@ def extract(
             return extracted, True
 
         if ocr and _OCR_AVAILABLE and not page0_ocr_done and not _EMAIL_RE.search(extracted):
-            contact_line = _extract_contact_info(doc)
+            # Best effort: when OCR is busy, return the digital text without contact info
+            if not holds_ocr_slot:
+                holds_ocr_slot = _ocr_slot.acquire(timeout=_CONTACT_OCR_WAIT_S)
+            contact_line = _extract_contact_info(doc) if holds_ocr_slot else ""
             if contact_line:
                 extracted = contact_line + "\n" + extracted
                 return extracted, True
@@ -255,13 +293,17 @@ def extract(
         return extracted, False
 
     finally:
-        doc.close()
-        # MuPDF keeps a process-wide resource store (decoded images, glyphs,
-        # ~256 MB default ceiling) that survives doc.close(). Cross-document
-        # reuse is worthless for one-shot CV extraction, and in long-running
-        # services the store reads as a ~10 MB/call leak on the OCR path.
-        fitz.TOOLS.store_shrink(100)
-
+        try:
+            doc.close()
+            # MuPDF keeps a process-wide resource store (decoded images, glyphs,
+            # ~256 MB default ceiling) that survives doc.close(). Cross-document
+            # reuse is worthless for one-shot CV extraction, and in long-running
+            # services the store reads as a ~10 MB/call leak on the OCR path.
+            fitz.TOOLS.store_shrink(100)
+        finally:
+            # Only after this document's memory is back, or the next OCR stacks on it
+            if holds_ocr_slot:
+                _ocr_slot.release()
 
 def _digital_text_usable(page_text: str, all_words: list) -> bool:
     """True when a page's extractable text is healthy enough to keep as-is.
