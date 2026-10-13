@@ -419,12 +419,16 @@ def ocr_env():
         yield mock_tess, mock_image_cls
 
 
-def _mock_page():
-    """MagicMock page whose get_pixmap yields a trivial grayscale buffer."""
+def _mock_page(rect=None):
+    """MagicMock page whose get_pixmap yields a trivial grayscale buffer.
+
+    rect defaults to A4; _ocr_page reads the page size to cap the render.
+    """
     pix = MagicMock(width=50, height=50, samples=b'\x80' * 2500)
     page = MagicMock()
     page.get_pixmap.return_value = pix
     page.number = 0
+    page.rect = rect or fitz.Rect(0, 0, 595, 842)
     return page
 
 
@@ -707,3 +711,22 @@ def test_few_drawings_does_not_trigger_drawing_score(tmp_path):
 
     _, is_image = extract(pdf_path)
     assert is_image is False
+
+
+def test_ocr_page_keeps_full_dpi_for_a4(ocr_env):
+    mock_tess, _ = ocr_env
+    mock_tess.image_to_data.return_value = _tess_data([])
+    page = _mock_page()
+    _m._ocr_page(page, dpi=300)
+    assert page.get_pixmap.call_args.kwargs["dpi"] == 300
+
+
+def test_ocr_page_caps_dpi_for_oversized_page(ocr_env):
+    """A 48x48in page at 300 dpi is ~207 MP (~2 GB peak, OOM-kills the worker); the render must fit the cap."""
+    mock_tess, _ = ocr_env
+    mock_tess.image_to_data.return_value = _tess_data([])
+    page = _mock_page(rect=fitz.Rect(0, 0, 48 * 72, 48 * 72))
+    _m._ocr_page(page, dpi=300)
+    dpi = page.get_pixmap.call_args.kwargs["dpi"]
+    assert dpi < 300
+    assert (48 * dpi) ** 2 <= _m._OCR_MAX_PIXELS

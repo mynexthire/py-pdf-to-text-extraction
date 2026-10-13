@@ -26,6 +26,7 @@ _SCORE_HIGH_DRAWINGS = 20
 _HIGH_DRAWING_COUNT = 500
 
 _OCR_DPI = 300               # 300 beats 200 by ~3.5 mean-confidence points on the CV corpus
+_OCR_MAX_PIXELS = 25_000_000 # render cap, ~3x an A4 page at 300 dpi; A4/Letter/Legal/A3 stay at full dpi
 _OCR_MIN_WORDS = 10
 _OCR_BUDGET = 3
 _OCR_LANG = "eng"
@@ -358,10 +359,21 @@ def _ocr_page(page, lang: str = _OCR_LANG, dpi: int = _OCR_DPI) -> str:
         return ""
     pix = None
     try:
+        # The page size is whatever the PDF says. A poster or banner-sized page
+        # rendered at 300 dpi is a pixmap of several GB, and the kernel kills the
+        # worker for it (48x48in measured 2 GB peak). Lower the dpi until the
+        # render fits under _OCR_MAX_PIXELS; normal page sizes are unaffected.
+        rect = page.rect
+        pixels = (rect.width / 72 * dpi) * (rect.height / 72 * dpi)
+        if pixels > _OCR_MAX_PIXELS:
+            dpi = max(1, int(dpi * (_OCR_MAX_PIXELS / pixels) ** 0.5))
+            _log.info("OCR render capped at %s dpi for a %.0fx%.0fpt page", dpi, rect.width, rect.height)
+
         # Render RGB — rendering grayscale at the MuPDF level loses
         # white-on-color name headers
         pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        # samples_mv is a view on the pixmap's buffer; .samples would copy it first
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples_mv)
         del pix
         pix = None
 
