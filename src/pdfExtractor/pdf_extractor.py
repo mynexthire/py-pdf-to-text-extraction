@@ -38,7 +38,6 @@ _OCR_BULLET_GAP_RATIO = 1.5  # leading <=2-char word with gap > ratio x height =
 _OCR_COLUMN_SAMPLES = 40     # vertical strips to probe when hunting for a column gutter
 _OCR_GUTTER_THRESHOLD = 0.15 # gutter must have < 15% of the darkest strip's pixel count
 _OCR_QUEUE_WAIT_S = 40.0     # services calling this give up at ~60s; a CV's OCR fits in the rest
-_CONTACT_OCR_WAIT_S = 10.0   # contact OCR is best effort, not worth a long wait
 
 # One document OCRing at a time per process. A page render plus Tesseract peaks
 # at a few hundred MB and saturates a core, so a service extracting on several
@@ -282,10 +281,12 @@ def extract(
             return extracted, True
 
         if ocr and _OCR_AVAILABLE and not page0_ocr_done and not _EMAIL_RE.search(extracted):
-            # Best effort: when OCR is busy, return the digital text without contact info
+            # Same queue as page OCR: skipping this silently would hand back a CV
+            # with no email/phone and the wrong image flag, so wait or refuse
             if not holds_ocr_slot:
-                holds_ocr_slot = _ocr_slot.acquire(timeout=_CONTACT_OCR_WAIT_S)
-            contact_line = _extract_contact_info(doc) if holds_ocr_slot else ""
+                _take_ocr_slot(_OCR_QUEUE_WAIT_S)
+                holds_ocr_slot = True
+            contact_line = _extract_contact_info(doc)
             if contact_line:
                 extracted = contact_line + "\n" + extracted
                 return extracted, True

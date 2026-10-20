@@ -772,18 +772,16 @@ def test_concurrent_scans_ocr_one_document_at_a_time(scanned_pdf):
     assert switches == 2
 
 
-def test_digital_extraction_does_not_wait_for_busy_ocr(digital_pdf):
-    """Digital text comes back while another document holds the OCR slot; contact OCR is skipped."""
+def test_contact_ocr_raises_busy_when_ocr_slot_stays_taken(digital_pdf):
+    """A digital CV with no email needs contact OCR; while another document holds the
+    slot it must refuse, not quietly return text with no contact line and the wrong flag."""
     with patch.object(_m, '_OCR_AVAILABLE', True), \
-         patch.object(_m, '_CONTACT_OCR_WAIT_S', 0.05), \
+         patch.object(_m, '_OCR_QUEUE_WAIT_S', 0.05), \
          patch.object(_m, '_extract_contact_info') as mock_contact, \
          _m.ocr_slot():
-        started = time.perf_counter()
-        text, is_image = _m.extract(digital_pdf)
-        elapsed = time.perf_counter() - started
+        with pytest.raises(_m.OcrBusyError):
+            _m.extract(digital_pdf)
     mock_contact.assert_not_called()
-    assert "Hello World" in text and is_image is False
-    assert elapsed < 1
 
 
 def test_scan_raises_busy_when_ocr_slot_stays_taken(scanned_pdf):
